@@ -2,6 +2,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 import { getAISuggestions } from './services/geminiService';
 import { ModelMetadata, AISuggestion, RenderingConfig, SceneConfig } from './types';
@@ -24,7 +25,8 @@ import {
   Zap,
   Palette,
   Eye,
-  Activity
+  Activity,
+  FileCode
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -69,7 +71,7 @@ const App: React.FC = () => {
     camera: THREE.PerspectiveCamera;
     renderer: THREE.WebGLRenderer;
     mixer: THREE.AnimationMixer | null;
-    model: THREE.Group | null;
+    model: THREE.Group | THREE.Object3D | null;
     clock: THREE.Clock;
     controls: OrbitControls;
     mainLight: THREE.DirectionalLight;
@@ -156,7 +158,6 @@ const App: React.FC = () => {
     const animate = () => {
       if (!isRendering) {
         requestAnimationFrame(animate);
-        // We handle delta locally in the loop to support speed factor
         const delta = clock.getDelta() * sceneParams.animationSpeed;
         if (sceneRef.current?.mixer) sceneRef.current.mixer.update(delta);
         if (sceneRef.current?.controls) sceneRef.current.controls.update();
@@ -187,11 +188,7 @@ const App: React.FC = () => {
   const applyAISuggestion = (suggestion: AISuggestion) => {
     if (!sceneRef.current) return;
     const { controls } = sceneRef.current;
-    
-    // Sync React state which will sync Three objects via the useEffect
     setSceneParams(suggestion);
-    
-    // Manual orbit controls update because it's stateful outside of params
     controls.target.set(suggestion.lookAt.x, suggestion.lookAt.y, suggestion.lookAt.z);
     controls.update();
   };
@@ -204,13 +201,30 @@ const App: React.FC = () => {
     setFile(uploadedFile);
     setVideoUrl(null);
 
+    const extension = uploadedFile.name.split('.').pop()?.toLowerCase();
     const reader = new FileReader();
+    
     reader.onload = async (e) => {
       const contents = e.target?.result as ArrayBuffer;
-      const loader = new FBXLoader();
+      let object: THREE.Object3D | null = null;
+      let animations: THREE.AnimationClip[] = [];
       
       try {
-        const object = loader.parse(contents, '');
+        if (extension === 'fbx') {
+          const loader = new FBXLoader();
+          object = loader.parse(contents, '');
+          animations = object.animations;
+        } else if (extension === 'glb' || extension === 'gltf') {
+          const loader = new GLTFLoader();
+          const gltf = await new Promise<any>((resolve, reject) => {
+            loader.parse(contents, '', resolve, reject);
+          });
+          object = gltf.scene;
+          animations = gltf.animations;
+        }
+
+        if (!object) throw new Error("Unsupported format");
+
         if (sceneRef.current?.model) sceneRef.current.scene.remove(sceneRef.current.model);
         
         const box = new THREE.Box3().setFromObject(object);
@@ -232,16 +246,19 @@ const App: React.FC = () => {
         sceneRef.current!.scene.add(object);
         sceneRef.current!.model = object;
 
-        if (object.animations.length > 0) {
+        // Store animations on the object for later access (normalized for both loaders)
+        (object as any).animations = animations;
+
+        if (animations.length > 0) {
           const mixer = new THREE.AnimationMixer(object);
-          mixer.clipAction(object.animations[0]).play();
+          mixer.clipAction(animations[0]).play();
           sceneRef.current!.mixer = mixer;
         }
 
         const meta: ModelMetadata = {
           name: uploadedFile.name,
           boneCount: 0,
-          animations: object.animations.map(a => ({ name: a.name, duration: a.duration }))
+          animations: animations.map(a => ({ name: a.name, duration: a.duration }))
         };
         object.traverse((child) => { if ((child as THREE.Bone).isBone) meta.boneCount++; });
 
@@ -252,7 +269,7 @@ const App: React.FC = () => {
         setActiveTab('ai');
 
       } catch (err) {
-        console.error("Error parsing FBX:", err);
+        console.error("Error parsing model:", err);
       } finally {
         setLoading(false);
       }
@@ -296,9 +313,9 @@ const App: React.FC = () => {
     recorder.start();
 
     const root = mixer.getRoot() as THREE.Object3D & { animations: THREE.AnimationClip[] };
-    const animation = root.animations && root.animations.length > 0 ? root.animations[0] : null;
+    const animationList = (root as any).animations || [];
+    const animation = animationList.length > 0 ? animationList[0] : null;
 
-    // Real duration adjusted by speed factor
     const duration = animation ? (mixer.existingAction(animation)?.getClip().duration || 5) : 5;
     const renderDuration = duration / sceneParams.animationSpeed;
     const totalFrames = renderDuration * renderConfig.fps;
@@ -310,7 +327,6 @@ const App: React.FC = () => {
 
     for (let i = 0; i < totalFrames; i++) {
       if (!isRendering && i > 0) break;
-      // We advance animation based on speed factor: Time = Frame * frameTime * speed
       mixer.setTime(i * frameTime * sceneParams.animationSpeed);
       renderer.render(scene, camera);
       await new Promise(r => setTimeout(r, 16)); 
@@ -346,7 +362,7 @@ const App: React.FC = () => {
           <label className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-white px-5 py-2.5 rounded-xl cursor-pointer transition border border-white/10">
             <Upload className="w-4 h-4 text-indigo-400" />
             <span className="text-sm font-semibold">{t.loadModel}</span>
-            <input type="file" accept=".fbx" className="hidden" onChange={handleFileUpload} />
+            <input type="file" accept=".fbx,.glb,.gltf" className="hidden" onChange={handleFileUpload} />
           </label>
         </div>
       </header>
@@ -383,7 +399,10 @@ const App: React.FC = () => {
                 {activeTab === 'info' && (
                    <div className="space-y-6 animate-in slide-in-from-left-4">
                      <div className="bg-slate-800/50 p-4 rounded-2xl border border-white/5 shadow-inner">
-                        <div className="flex items-center gap-3 mb-3 text-indigo-400"><Box className="w-4 h-4"/> <span className="text-xs font-bold uppercase tracking-widest">{t.geometry}</span></div>
+                        <div className="flex items-center gap-3 mb-3 text-indigo-400">
+                          {metadata.name.toLowerCase().endsWith('.fbx') ? <FileCode className="w-4 h-4"/> : <Box className="w-4 h-4"/>}
+                          <span className="text-xs font-bold uppercase tracking-widest">{t.geometry}</span>
+                        </div>
                         <p className="text-sm font-medium truncate mb-1">{metadata.name}</p>
                         <p className="text-[10px] text-slate-500">{metadata.boneCount} {t.skeleton}</p>
                      </div>
@@ -396,6 +415,9 @@ const App: React.FC = () => {
                               <span className="text-slate-500">{a.duration.toFixed(2)}s</span>
                             </div>
                           ))}
+                          {metadata.animations.length === 0 && (
+                            <p className="text-[10px] text-slate-500 italic py-2 text-center">No animations found</p>
+                          )}
                         </div>
                      </div>
                    </div>
@@ -420,7 +442,6 @@ const App: React.FC = () => {
 
                 {activeTab === 'settings' && (
                   <div className="space-y-6 animate-in fade-in">
-                    {/* Visual Settings Section */}
                     <div className="space-y-4">
                       <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
                         <Palette className="w-3 h-3" /> {t.visuals}
@@ -456,7 +477,6 @@ const App: React.FC = () => {
                       </label>
                     </div>
 
-                    {/* Lighting Section */}
                     <div className="space-y-4">
                       <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
                         <Sun className="w-3 h-3" /> {t.lightSettings}
@@ -499,7 +519,6 @@ const App: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Animation Speed Section */}
                     <div className="space-y-4">
                       <h4 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2 border-b border-white/5 pb-2">
                         <Zap className="w-3 h-3" /> {t.animSpeed}
@@ -596,7 +615,6 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Center Record Button */}
           <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-20">
             {isRendering ? (
               <div className="flex flex-col items-center gap-4">
@@ -620,7 +638,6 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {/* Tooltip Overlay */}
           {!file && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-xl animate-in fade-in">
               <div className="max-w-md w-full text-center space-y-8 p-12">
@@ -637,7 +654,7 @@ const App: React.FC = () => {
                  <label className="inline-flex items-center gap-3 bg-indigo-600 hover:bg-indigo-500 text-white px-10 py-5 rounded-2xl cursor-pointer font-black uppercase tracking-widest transition shadow-2xl shadow-indigo-600/40 transform hover:-translate-y-1">
                     <Upload className="w-5 h-5" />
                     {t.dropBtn}
-                    <input type="file" accept=".fbx" className="hidden" onChange={handleFileUpload} />
+                    <input type="file" accept=".fbx,.glb,.gltf" className="hidden" onChange={handleFileUpload} />
                  </label>
               </div>
             </div>
