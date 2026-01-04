@@ -1,0 +1,7 @@
+{
+  "name": "FBX-to-Video Cloud Renderer",
+  "description": "A high-performance WebGL-based rendering engine that converts FBX files with animations into video using Three.js and the MediaRecorder API, featuring AI-assisted cinematic configuration.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
